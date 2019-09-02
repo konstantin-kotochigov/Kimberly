@@ -2,70 +2,34 @@ import sys
 from pyspark.sql import SparkSession
 from hdfs import InsecureClient
 
-import time
 import datetime
 import pandas
 
-from cj_loader import CJ_Loader
-from cj_predictor import CJ_Predictor
-from cj_export import CJ_Export
+from CJDataExtractor import CJDataExtractor
 
-start_processing = time.time()
-
-# Static Parameters
-# hdfs_host = "http://136.243.150.16:50070"
 org_id = "fe8cf20f-c2a6-4ba9-bd28-36a9d126afc8"
 wd = "/tmp/"
-# temporary_local_file_path = "./data_export"
-
-def parse_arguments():
-
-    argument_vector = sys.argv[1:]
-    if len(sys.argv) != 6:
-        argument_vector = ['true','true','2010-01-01','2020-01-01','/user/kkotochigov/']
-        raise Exception("command must have 6 arguments")
-    
-    arg_send_update, arg_refit, arg_from_dt, arg_to_dt, arg_descriptor_path = argument_vector
-    
-    arg_send_update = bool(arg_send_update)
-    arg_refit = bool(arg_refit)
-    arg_from_dt = arg_from_dt.split("-")
-    arg_to_dt = arg_to_dt.split("-")
-    
-    print("Send_update = {}, Refit Model = {}; Period = ({},{})".format(arg_send_update, arg_refit, "/".join(arg_from_dt), "/".join(arg_to_dt)))
-    return arg_send_update, arg_refit, arg_from_dt, arg_to_dt, arg_descriptor_path
-
-
-# arg_send_update, arg_refit, arg_from_dt, arg_to_dt, arg_descriptor_path = parse_arguments()
 
 # Create or Get Spark Session
 spark = SparkSession.builder.appName('analytical_attributes').getOrCreate()
 
-# hdfs_client = InsecureClient(hdfs_host, "hdfs")
+ts_from=(2018,5,15)
+ts_to=(2020,8,15)
+
+extractor = CJDataExtractor(spark, org_id)
+extractor.load(ts_from, ts_to)
+extractor.save(output_path=wd+"/cj_extract")
+
+# Custom Dataset Transformation
+x = spark.read.parquet(wd+"/cj_extract")
+y = x.groupBy("fpc").agg(F.collect_set("event").alias("events"))
+y = y.withColumn("target",F.when(F.size(y.events)>1, 1).otherwise(0))
+y.select("fpc","target").coalesce(1).write.mode("overwrite").csv(wd+"model_train_dataset")
 
 
-# Check whether We Need to Refit
-# update_model_every = 60*24*7 # in seconds
-# model_file_list = hdfs_client.list(wd+"models/", status=True)
-# model_modification_ts = next(iter([model_filename[1]['modificationTime'] for model_filename in model_file_list if model_filename[0] == "model.h5"]), None)
-# model_needs_update = True if (model_modification_ts == None) or (time.time() - model_modification_ts > update_model_every) or (arg_refit) else False
-# print("Refit = {}".format(model_needs_update))
-
-# Load Data
-cjp = CJ_Loader(spark)
-cjp.set_organization(org_id)
-cjp.load_cj(ts_from=[int(x) for x in arg_from_dt], ts_to=[int(x) for x in arg_to_dt])
-# cjp.cj_stats(ts_from=(2018,12,1), ts_to=(2018,12,31))
-cjp.cj_data.createOrReplaceTempView('cj')
-(cj_authorized, cj_non_authorized) = cjp.extract_attributes()
-data_authorized = cjp.process_attributes(cj_authorized)
-# data_non_authorized = cjp.process_attributes(cj_non_authorized)
-
-data_authorized.to_parquet(temporary_local_file_path)
-
-data_authorized = pandas.read_parquet(temporary_local_file_path)
 
 # Make Model
+
 predictor = CJ_Predictor(wd+"models/")
 predictor.set_data(data_authorized)
 predictor.optimize(batch_size=4096)
